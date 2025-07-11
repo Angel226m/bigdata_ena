@@ -1,4 +1,3 @@
-# Dockerfile para el procesador de datos
 FROM python:3.9-slim
 
 WORKDIR /app
@@ -20,5 +19,5 @@ COPY helpers/ ./helpers/
 # Crear directorio para logs
 RUN mkdir -p /tmp
 
-# Comando de ejecución
+# Comando por defecto (se puede sobrescribir)
 CMD ["python", "process_data.py"]
