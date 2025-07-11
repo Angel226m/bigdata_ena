@@ -1,14 +1,9 @@
-# Script principal de procesamiento 
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
 """
 Script principal para procesamiento de datos de la ENA 2021
-Este script coordina todo el procesamiento de datos:
-1. Carga los archivos CSV
-2. Procesa y carga tablas dimensionales
-3. Publica datos en Kafka
-4. Procesa y carga tablas de hechos
+Adaptado para trabajar con nombres de archivos en formato: 01_Cap100_1_0.csv
 """
 
 import os
@@ -21,15 +16,14 @@ from datetime import datetime
 # Importar módulos auxiliares
 from helpers.kafka_utils import create_producer, publish_message
 from helpers.postgres_utils import get_db_connection
-from load_dimensions import load_all_dimensions
+from load_dimensions import load_all_dimensions, find_file_by_pattern
 
 # Configurar logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('/tmp/ena_processing.log')
+        logging.StreamHandler()
     ]
 )
 logger = logging.getLogger('ena_processor')
@@ -41,13 +35,11 @@ KAFKA_TOPIC_PECUARIA = 'ena-pecuaria'
 KAFKA_TOPIC_SERVICIOS = 'ena-servicios'
 KAFKA_TOPIC_RIEGO = 'ena-riego'
 
-
 def list_csv_files():
     """Lista todos los archivos CSV en el directorio de datos"""
     csv_files = glob.glob(os.path.join(DATA_DIR, "*.csv"))
     logger.info(f"Se encontraron {len(csv_files)} archivos CSV")
     return csv_files
-
 
 def process_cap200_data(producer):
     """Procesa datos del capítulo 200 (Producción Agrícola)"""
@@ -55,83 +47,138 @@ def process_cap200_data(producer):
     
     # Cargar archivos relacionados
     try:
-        cap200a = pd.read_csv(os.path.join(DATA_DIR, "Cap200a ENA 2021.csv"), low_memory=False)
-        cap200c = pd.read_csv(os.path.join(DATA_DIR, "Cap200c ENA 2021.csv"), low_memory=False)
-        cap200d = pd.read_csv(os.path.join(DATA_DIR, "Cap200d ENA 2021.csv"), low_memory=False)
-        cap200e = pd.read_csv(os.path.join(DATA_DIR, "Cap200e ENA 2021.csv"), low_memory=False)
+        # Buscar archivos por patrón
+        file_200a = find_file_by_pattern("Cap200a")
+        file_200c = find_file_by_pattern("Cap200c")
+        file_200d = find_file_by_pattern("Cap200d")
+        file_200e = find_file_by_pattern("Cap200e")
         
-        logger.info(f"Archivos cargados - Cap200a: {len(cap200a)} registros, Cap200c: {len(cap200c)} registros")
+        if not file_200a or not file_200c:
+            logger.error("No se encontraron archivos esenciales del capítulo 200")
+            return
+            
+        cap200a = pd.read_csv(file_200a, low_memory=False)
+        cap200c = pd.read_csv(file_200c, low_memory=False)
+        
+        logger.info(f"Archivos cargados - {os.path.basename(file_200a)}: {len(cap200a)} registros, {os.path.basename(file_200c)}: {len(cap200c)} registros")
+        
+        # Mostrar las columnas disponibles
+        print("Columnas en Cap200a:", cap200a.columns.tolist())
+        print("Columnas en Cap200c:", cap200c.columns.tolist())
+        
+        # Identificar columnas clave para la unión
+        join_columns = []
+        for col in ['ANIO', 'CCDD', 'CCPP', 'CCDI', 'CONGLOMERADO', 'NSELUA', 'UA', 'CODIGO', 'P204_COD']:
+            if col in cap200a.columns and col in cap200c.columns:
+                join_columns.append(col)
+        
+        if not join_columns:
+            logger.error("No se encontraron columnas comunes para unir los datos")
+            return
+            
+        logger.info(f"Uniendo datos usando columnas: {join_columns}")
         
         # Procesar datos básicos
         base_agricola = cap200a.merge(
             cap200c, 
-            on=['ANIO', 'CCDD', 'CCPP', 'CCDI', 'CONGLOMERADO', 'NSELUA', 'UA', 'CODIGO', 'P204_COD'],
+            on=join_columns,
             how='inner'
         )
         
-        # Agregar datos de costos
-        base_agricola = base_agricola.merge(
-            cap200e,
-            on=['ANIO', 'CCDD', 'CCPP', 'CCDI', 'CONGLOMERADO', 'NSELUA', 'UA', 'CODIGO', 'P204_COD'],
-            how='left'
-        )
+        # Agregar datos de costos si está disponible el archivo
+        if file_200e:
+            cap200e = pd.read_csv(file_200e, low_memory=False)
+            print("Columnas en Cap200e:", cap200e.columns.tolist())
+            
+            # Intentar unir con datos de costos
+            try:
+                base_agricola = base_agricola.merge(
+                    cap200e,
+                    on=join_columns,
+                    how='left'
+                )
+            except Exception as e:
+                logger.warning(f"No se pudieron unir datos de costos: {e}")
         
-        # Agregar datos de destino de producción
-        base_agricola = base_agricola.merge(
-            cap200d,
-            on=['ANIO', 'CCDD', 'CCPP', 'CCDI', 'CONGLOMERADO', 'NSELUA', 'UA', 'CODIGO', 'P204_COD'],
-            how='left'
-        )
+        # Agregar datos de destino de producción si está disponible el archivo
+        if file_200d:
+            cap200d = pd.read_csv(file_200d, low_memory=False)
+            print("Columnas en Cap200d:", cap200d.columns.tolist())
+            
+            # Intentar unir con datos de destino
+            try:
+                base_agricola = base_agricola.merge(
+                    cap200d,
+                    on=join_columns,
+                    how='left'
+                )
+            except Exception as e:
+                logger.warning(f"No se pudieron unir datos de destino: {e}")
         
+        # Identificar columnas de producción
+        superficie_sembrada_col = next((col for col in cap200a.columns if 'P218A' in col), None)
+        superficie_cosechada_col = next((col for col in cap200a.columns if 'P218B' in col), None)
+        produccion_ent_col = next((col for col in cap200c.columns if 'PROD_CORTE_ENT' in col), None)
+        produccion_dec_col = next((col for col in cap200c.columns if 'PROD_CORTE_DEC' in col), None)
+        
+        if not superficie_sembrada_col or not superficie_cosechada_col:
+            logger.error("No se encontraron columnas de superficie sembrada/cosechada")
+            return
+            
+        if not produccion_ent_col or not produccion_dec_col:
+            logger.error("No se encontraron columnas de producción")
+            return
+            
         # Calcular producción total combinando parte entera y decimal
-        base_agricola['PRODUCCION_TOTAL'] = base_agricola['P218C_PROD_CORTE_ENT'].fillna(0) + \
-                                           base_agricola['P218C_PROD_CORTE_DEC'].fillna(0)
+        base_agricola['PRODUCCION_TOTAL'] = base_agricola[produccion_ent_col].fillna(0) + \
+                                           base_agricola[produccion_dec_col].fillna(0)
         
         # Calcular rendimiento (producción / superficie cosechada)
         base_agricola['RENDIMIENTO'] = base_agricola.apply(
-            lambda x: x['PRODUCCION_TOTAL'] / x['P218B'] if x['P218B'] > 0 else 0, 
+            lambda x: x['PRODUCCION_TOTAL'] / x[superficie_cosechada_col] if x[superficie_cosechada_col] > 0 else 0, 
             axis=1
         )
         
         # Publicar datos en Kafka
+        records_published = 0
         for _, row in base_agricola.iterrows():
-            # Crear mensaje con los campos relevantes
-            message = {
-                'ANIO': int(row['ANIO']),
-                'CCDD': str(row['CCDD']),
-                'CCPP': str(row['CCPP']),
-                'CCDI': str(row['CCDI']),
-                'CONGLOMERADO': str(row['CONGLOMERADO']),
-                'NSELUA': str(row['NSELUA']),
-                'UA': str(row['UA']),
-                'CODIGO': str(row['CODIGO']),
-                'P204_COD': str(row['P204_COD']),
-                'P204_NOM': str(row['P204_NOM']) if 'P204_NOM' in row else '',
-                'P204_TIPO': str(row['P204_TIPO']) if 'P204_TIPO' in row else '',
-                'SUPERFICIE_SEMBRADA': float(row['P218A']) if pd.notna(row['P218A']) else 0.0,
-                'SUPERFICIE_COSECHADA': float(row['P218B']) if pd.notna(row['P218B']) else 0.0,
-                'PRODUCCION_TOTAL': float(row['PRODUCCION_TOTAL']),
-                'RENDIMIENTO': float(row['RENDIMIENTO']),
-                'timestamp': datetime.now().isoformat()
-            }
-            
-            # Agregar campos de costos si están disponibles
-            if 'P235_COSTO_SEMILLA' in row:
-                message['COSTO_SEMILLA'] = float(row['P235_COSTO_SEMILLA']) if pd.notna(row['P235_COSTO_SEMILLA']) else 0.0
-            
-            # Agregar campos de destino si están disponibles
-            if 'P232A_VENTA' in row:
-                message['DESTINO_VENTA'] = float(row['P232A_VENTA']) if pd.notna(row['P232A_VENTA']) else 0.0
-            
-            # Publicar mensaje
-            publish_message(producer, KAFKA_TOPIC_AGRICOLA, message)
+            try:
+                # Crear mensaje con los campos relevantes
+                message = {
+                    'ANIO': int(row['ANIO']) if 'ANIO' in row and pd.notna(row['ANIO']) else 2021,
+                    'CCDD': str(row['CCDD']) if 'CCDD' in row else '',
+                    'CCPP': str(row['CCPP']) if 'CCPP' in row else '',
+                    'CCDI': str(row['CCDI']) if 'CCDI' in row else '',
+                    'CONGLOMERADO': str(row['CONGLOMERADO']) if 'CONGLOMERADO' in row else '',
+                    'NSELUA': str(row['NSELUA']) if 'NSELUA' in row else '',
+                    'UA': str(row['UA']) if 'UA' in row else '',
+                    'CODIGO': str(row['CODIGO']) if 'CODIGO' in row else '',
+                    'P204_COD': str(row['P204_COD']) if 'P204_COD' in row else '',
+                    'P204_NOM': str(row['P204_NOM']) if 'P204_NOM' in row else '',
+                    'P204_TIPO': str(row['P204_TIPO']) if 'P204_TIPO' in row else '',
+                    'SUPERFICIE_SEMBRADA': float(row[superficie_sembrada_col]) if pd.notna(row[superficie_sembrada_col]) else 0.0,
+                    'SUPERFICIE_COSECHADA': float(row[superficie_cosechada_col]) if pd.notna(row[superficie_cosechada_col]) else 0.0,
+                    'PRODUCCION_TOTAL': float(row['PRODUCCION_TOTAL']),
+                    'RENDIMIENTO': float(row['RENDIMIENTO']),
+                    'timestamp': datetime.now().isoformat()
+                }
+                
+                # Publicar mensaje
+                publish_message(producer, KAFKA_TOPIC_AGRICOLA, message)
+                records_published += 1
+                
+                # Mostrar progreso cada 1000 registros
+                if records_published % 1000 == 0:
+                    logger.info(f"Progreso: {records_published} registros publicados")
+                
+            except Exception as e:
+                logger.error(f"Error al publicar mensaje: {e}")
         
-        logger.info(f"Se publicaron {len(base_agricola)} registros en Kafka (tema: {KAFKA_TOPIC_AGRICOLA})")
+        logger.info(f"Se publicaron {records_published} registros en Kafka (tema: {KAFKA_TOPIC_AGRICOLA})")
     
     except Exception as e:
         logger.error(f"Error al procesar datos del capítulo 200: {e}")
         raise
-
 
 def process_cap400_data(producer):
     """Procesa datos del capítulo 400 (Producción Pecuaria)"""
@@ -139,38 +186,65 @@ def process_cap400_data(producer):
     
     # Cargar archivos relacionados
     try:
-        cap400a_1 = pd.read_csv(os.path.join(DATA_DIR, "Cap400a_1 ENA 2021.csv"), low_memory=False)
-        cap400a_2 = pd.read_csv(os.path.join(DATA_DIR, "Cap400a_2 ENA 2021.csv"), low_memory=False)
-        cap400c = pd.read_csv(os.path.join(DATA_DIR, "Cap400c ENA 2021.csv"), low_memory=False)
+        # Buscar archivos por patrón
+        file_400a_1 = find_file_by_pattern("Cap400a_1")
+        file_400a_2 = find_file_by_pattern("Cap400a_2")
+        file_400c = find_file_by_pattern("Cap400c")
         
-        logger.info(f"Archivos cargados - Cap400a_1: {len(cap400a_1)} registros, Cap400a_2: {len(cap400a_2)} registros")
+        if not file_400a_1:
+            logger.error("No se encontró el archivo esencial Cap400a_1")
+            return
+            
+        cap400a_1 = pd.read_csv(file_400a_1, low_memory=False)
+        
+        logger.info(f"Archivo cargado - {os.path.basename(file_400a_1)}: {len(cap400a_1)} registros")
+        
+        # Mostrar las columnas disponibles
+        print("Columnas en Cap400a_1:", cap400a_1.columns.tolist())
+        
+        # Identificar columnas relevantes
+        tipo_animal_col = next((col for col in cap400a_1.columns if 'ESPECIE' in col), None)
+        cantidad_col = next((col for col in cap400a_1.columns if 'NRO' in col), None)
+        
+        if not tipo_animal_col or not cantidad_col:
+            logger.error("No se encontraron columnas de tipo de animal o cantidad")
+            return
         
         # Procesar datos básicos (inventario ganadero)
+        records_published = 0
         for _, row in cap400a_1.iterrows():
-            # Crear mensaje con los campos relevantes
-            message = {
-                'ANIO': int(row['ANIO']) if 'ANIO' in row else 2021,
-                'CCDD': str(row['CCDD']),
-                'CCPP': str(row['CCPP']),
-                'CCDI': str(row['CCDI']),
-                'CONGLOMERADO': str(row['CONGLOMERADO']),
-                'NSELUA': str(row['NSELUA']),
-                'UA': str(row['UA']),
-                'CODIGO': str(row['CODIGO']),
-                'TIPO_ANIMAL': str(row['P402_ESPECIE']) if 'P402_ESPECIE' in row else '',
-                'CANTIDAD_ANIMALES': int(row['P402_NRO']) if 'P402_NRO' in row and pd.notna(row['P402_NRO']) else 0,
-                'timestamp': datetime.now().isoformat()
-            }
-            
-            # Publicar mensaje
-            publish_message(producer, KAFKA_TOPIC_PECUARIA, message)
+            try:
+                # Crear mensaje con los campos relevantes
+                message = {
+                    'ANIO': int(row['ANIO']) if 'ANIO' in row and pd.notna(row['ANIO']) else 2021,
+                    'CCDD': str(row['CCDD']) if 'CCDD' in row else '',
+                    'CCPP': str(row['CCPP']) if 'CCPP' in row else '',
+                    'CCDI': str(row['CCDI']) if 'CCDI' in row else '',
+                    'CONGLOMERADO': str(row['CONGLOMERADO']) if 'CONGLOMERADO' in row else '',
+                    'NSELUA': str(row['NSELUA']) if 'NSELUA' in row else '',
+                    'UA': str(row['UA']) if 'UA' in row else '',
+                    'CODIGO': str(row['CODIGO']) if 'CODIGO' in row else '',
+                    'TIPO_ANIMAL': str(row[tipo_animal_col]) if tipo_animal_col in row and pd.notna(row[tipo_animal_col]) else '',
+                    'CANTIDAD_ANIMALES': int(row[cantidad_col]) if cantidad_col in row and pd.notna(row[cantidad_col]) else 0,
+                    'timestamp': datetime.now().isoformat()
+                }
+                
+                # Publicar mensaje
+                publish_message(producer, KAFKA_TOPIC_PECUARIA, message)
+                records_published += 1
+                
+                # Mostrar progreso cada 1000 registros
+                if records_published % 1000 == 0:
+                    logger.info(f"Progreso: {records_published} registros publicados")
+                
+            except Exception as e:
+                logger.error(f"Error al publicar mensaje: {e}")
         
-        logger.info(f"Se publicaron {len(cap400a_1)} registros pecuarios en Kafka (tema: {KAFKA_TOPIC_PECUARIA})")
+        logger.info(f"Se publicaron {records_published} registros pecuarios en Kafka (tema: {KAFKA_TOPIC_PECUARIA})")
     
     except Exception as e:
         logger.error(f"Error al procesar datos del capítulo 400: {e}")
         raise
-
 
 def process_cap700_cap800_data(producer):
     """Procesa datos de los capítulos 700 y 800 (Servicios agrarios)"""
@@ -178,36 +252,61 @@ def process_cap700_cap800_data(producer):
     
     # Cargar archivos relacionados
     try:
-        cap700 = pd.read_csv(os.path.join(DATA_DIR, "Cap700 ENA 2021.csv"), low_memory=False)
-        cap800 = pd.read_csv(os.path.join(DATA_DIR, "Cap800 ENA 2021.csv"), low_memory=False)
+        # Buscar archivos por patrón
+        file_700 = find_file_by_pattern("Cap700")
+        file_800 = find_file_by_pattern("Cap800")
         
-        logger.info(f"Archivos cargados - Cap700: {len(cap700)} registros, Cap800: {len(cap800)} registros")
+        if not file_700 and not file_800:
+            logger.error("No se encontraron archivos de servicios agrarios (cap. 700 o 800)")
+            return
         
         # Procesar datos de capacitación
-        for _, row in cap700.iterrows():
-            # Crear mensaje con los campos relevantes
-            message = {
-                'ANIO': int(row['ANIO']) if 'ANIO' in row else 2021,
-                'CCDD': str(row['CCDD']),
-                'CCPP': str(row['CCPP']),
-                'CCDI': str(row['CCDI']),
-                'CONGLOMERADO': str(row['CONGLOMERADO']),
-                'NSELUA': str(row['NSELUA']),
-                'UA': str(row['UA']),
-                'CODIGO': str(row['CODIGO']),
-                'RECIBE_CAPACITACION': bool(row['P701']) if 'P701' in row and pd.notna(row['P701']) else False,
-                'timestamp': datetime.now().isoformat()
-            }
+        if file_700:
+            cap700 = pd.read_csv(file_700, low_memory=False)
+            logger.info(f"Archivo cargado - {os.path.basename(file_700)}: {len(cap700)} registros")
             
-            # Publicar mensaje
-            publish_message(producer, KAFKA_TOPIC_SERVICIOS, message)
-        
-        logger.info(f"Se publicaron {len(cap700)} registros de servicios en Kafka (tema: {KAFKA_TOPIC_SERVICIOS})")
+            # Mostrar las columnas disponibles
+            print("Columnas en Cap700:", cap700.columns.tolist())
+            
+            # Identificar columna de capacitación
+            capacitacion_col = next((col for col in cap700.columns if 'P701' in col), None)
+            
+            if not capacitacion_col:
+                logger.warning("No se encontró columna de capacitación en Cap700")
+            
+            records_published = 0
+            for _, row in cap700.iterrows():
+                try:
+                    # Crear mensaje con los campos relevantes
+                    message = {
+                        'ANIO': int(row['ANIO']) if 'ANIO' in row and pd.notna(row['ANIO']) else 2021,
+                        'CCDD': str(row['CCDD']) if 'CCDD' in row else '',
+                        'CCPP': str(row['CCPP']) if 'CCPP' in row else '',
+                        'CCDI': str(row['CCDI']) if 'CCDI' in row else '',
+                        'CONGLOMERADO': str(row['CONGLOMERADO']) if 'CONGLOMERADO' in row else '',
+                        'NSELUA': str(row['NSELUA']) if 'NSELUA' in row else '',
+                        'UA': str(row['UA']) if 'UA' in row else '',
+                        'CODIGO': str(row['CODIGO']) if 'CODIGO' in row else '',
+                        'RECIBE_CAPACITACION': bool(row[capacitacion_col]) if capacitacion_col in row and pd.notna(row[capacitacion_col]) else False,
+                        'timestamp': datetime.now().isoformat()
+                    }
+                    
+                    # Publicar mensaje
+                    publish_message(producer, KAFKA_TOPIC_SERVICIOS, message)
+                    records_published += 1
+                    
+                    # Mostrar progreso cada 1000 registros
+                    if records_published % 1000 == 0:
+                        logger.info(f"Progreso: {records_published} registros publicados")
+                    
+                except Exception as e:
+                    logger.error(f"Error al publicar mensaje: {e}")
+            
+            logger.info(f"Se publicaron {records_published} registros de servicios en Kafka (tema: {KAFKA_TOPIC_SERVICIOS})")
     
     except Exception as e:
         logger.error(f"Error al procesar datos de servicios agrarios: {e}")
         raise
-
 
 def process_cap500_data(producer):
     """Procesa datos del capítulo 500 (Riego)"""
@@ -215,36 +314,62 @@ def process_cap500_data(producer):
     
     # Cargar archivos relacionados
     try:
-        cap500ab = pd.read_csv(os.path.join(DATA_DIR, "Cap500ab ENA 2021.csv"), low_memory=False)
+        # Buscar archivo por patrón
+        file_500ab = find_file_by_pattern("Cap500ab")
         
-        logger.info(f"Archivos cargados - Cap500ab: {len(cap500ab)} registros")
+        if not file_500ab:
+            logger.error("No se encontró el archivo de riego (cap. 500)")
+            return
+            
+        cap500ab = pd.read_csv(file_500ab, low_memory=False)
+        
+        logger.info(f"Archivo cargado - {os.path.basename(file_500ab)}: {len(cap500ab)} registros")
+        
+        # Mostrar las columnas disponibles
+        print("Columnas en Cap500ab:", cap500ab.columns.tolist())
+        
+        # Identificar columnas relevantes
+        tipo_riego_col = next((col for col in cap500ab.columns if 'TIPO' in col), None)
+        superficie_col = next((col for col in cap500ab.columns if 'SUP' in col), None)
+        
+        if not tipo_riego_col or not superficie_col:
+            logger.warning("No se encontraron columnas de tipo de riego o superficie")
         
         # Procesar datos de riego
+        records_published = 0
         for _, row in cap500ab.iterrows():
-            # Crear mensaje con los campos relevantes
-            message = {
-                'ANIO': int(row['ANIO']) if 'ANIO' in row else 2021,
-                'CCDD': str(row['CCDD']),
-                'CCPP': str(row['CCPP']),
-                'CCDI': str(row['CCDI']),
-                'CONGLOMERADO': str(row['CONGLOMERADO']),
-                'NSELUA': str(row['NSELUA']),
-                'UA': str(row['UA']),
-                'CODIGO': str(row['CODIGO']),
-                'TIPO_RIEGO': str(row['P509_TIPO']) if 'P509_TIPO' in row else '',
-                'SUPERFICIE_RIEGO': float(row['P509_SUP']) if 'P509_SUP' in row and pd.notna(row['P509_SUP']) else 0.0,
-                'timestamp': datetime.now().isoformat()
-            }
-            
-            # Publicar mensaje
-            publish_message(producer, KAFKA_TOPIC_RIEGO, message)
+            try:
+                # Crear mensaje con los campos relevantes
+                message = {
+                    'ANIO': int(row['ANIO']) if 'ANIO' in row and pd.notna(row['ANIO']) else 2021,
+                    'CCDD': str(row['CCDD']) if 'CCDD' in row else '',
+                    'CCPP': str(row['CCPP']) if 'CCPP' in row else '',
+                    'CCDI': str(row['CCDI']) if 'CCDI' in row else '',
+                    'CONGLOMERADO': str(row['CONGLOMERADO']) if 'CONGLOMERADO' in row else '',
+                    'NSELUA': str(row['NSELUA']) if 'NSELUA' in row else '',
+                    'UA': str(row['UA']) if 'UA' in row else '',
+                    'CODIGO': str(row['CODIGO']) if 'CODIGO' in row else '',
+                    'TIPO_RIEGO': str(row[tipo_riego_col]) if tipo_riego_col in row and pd.notna(row[tipo_riego_col]) else '',
+                    'SUPERFICIE_RIEGO': float(row[superficie_col]) if superficie_col in row and pd.notna(row[superficie_col]) else 0.0,
+                    'timestamp': datetime.now().isoformat()
+                }
+                
+                # Publicar mensaje
+                publish_message(producer, KAFKA_TOPIC_RIEGO, message)
+                records_published += 1
+                
+                # Mostrar progreso cada 1000 registros
+                if records_published % 1000 == 0:
+                    logger.info(f"Progreso: {records_published} registros publicados")
+                
+            except Exception as e:
+                logger.error(f"Error al publicar mensaje: {e}")
         
-        logger.info(f"Se publicaron {len(cap500ab)} registros de riego en Kafka (tema: {KAFKA_TOPIC_RIEGO})")
+        logger.info(f"Se publicaron {records_published} registros de riego en Kafka (tema: {KAFKA_TOPIC_RIEGO})")
     
     except Exception as e:
         logger.error(f"Error al procesar datos de riego: {e}")
         raise
-
 
 def main():
     """Función principal del procesador de datos"""

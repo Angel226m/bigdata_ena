@@ -1,15 +1,14 @@
--- Esquema para base de datos ENA 
 -- Creación de esquema para la Encuesta Nacional Agropecuaria (ENA) 2021
 -- Este script crea todas las tablas dimensionales y de hechos necesarias
 
 -- Tablas de dimensiones
 CREATE TABLE dim_ubicacion (
     id_ubicacion SERIAL PRIMARY KEY,
-    ccdd VARCHAR(2),
+    ccdd VARCHAR(10),
     nombredd VARCHAR(100),
-    ccpp VARCHAR(2),
+    ccpp VARCHAR(10),
     nombrepv VARCHAR(100),
-    ccdi VARCHAR(2),
+    ccdi VARCHAR(10),
     nombredi VARCHAR(100),
     region VARCHAR(50),
     dominio VARCHAR(50),
@@ -29,7 +28,7 @@ CREATE TABLE dim_productor (
 
 CREATE TABLE dim_cultivo (
     id_cultivo SERIAL PRIMARY KEY,
-    codigo VARCHAR(10) UNIQUE,          -- P204_COD
+    codigo VARCHAR(20) UNIQUE,          -- P204_COD
     nombre VARCHAR(100),                -- P204_NOM
     tipo VARCHAR(50)                    -- P204_TIPO
 );

@@ -15,8 +15,8 @@ from kafka import KafkaProducer, KafkaConsumer
 logger = logging.getLogger('kafka_utils')
 
 # Constantes
-# Constantes
-KAFKA_BOOTSTRAP_SERVERS = os.environ.get('KAFKA_BOOTSTRAP_SERVERS', 'kafka:9092')
+ 
+KAFKA_BOOTSTRAP_SERVERS = os.environ.get('KAFKA_BOOTSTRAP_SERVERS', 'kafka:29092')
 
 
 def create_producer():
